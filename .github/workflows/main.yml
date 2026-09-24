@@ -1,21 +1,32 @@
-name: Shopify Site Harvester
+name: Shopify Scraper
 
 on:
   workflow_dispatch:
 
 jobs:
-  harvest:
+  scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 358
+    timeout-minutes: 350
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
-      - run: go build -o harvester harvester.go
-      - run: ./harvester
-      - uses: actions/upload-artifact@v4
+          go-version: '1.22'
+
+      - name: Build scraper
+        run: go build -o shopify-scraper main.go
+
+      - name: Run scraper
+        run: ./shopify-scraper
+
+      - name: Upload results as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: valid-sites
-          path: valid_sites*.txt
-          retention-days: 30
+          name: shopify-valid-stores
+          path: valid_stores.txt
+          retention-days: 90
