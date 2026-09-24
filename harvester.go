@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -9,7 +10,7 @@ import (
 	"io"
 	"log"
 	"math/rand"
-  "net"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -45,6 +46,7 @@ type Progress struct {
 	ValidFound      int64
 	Phase           string
 	StartTime       time.Time
+	SBRequestsUsed  int64
 }
 
 var progress = &Progress{StartTime: time.Now()}
@@ -63,7 +65,7 @@ var httpClient = &http.Client{
 		DisableCompression:  true,
 		ForceAttemptHTTP2:   true,
 	},
-	Timeout: 15 * time.Second,
+	Timeout: 20 * time.Second,
 }
 
 // ==========================================
@@ -73,9 +75,7 @@ var httpClient = &http.Client{
 func tgSendText(msg string) {
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", TG_BOT_TOKEN)
 	payload, _ := json.Marshal(map[string]interface{}{
-		"chat_id":    TG_CHAT_ID,
-		"text":       msg,
-		"parse_mode": "HTML",
+		"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML",
 	})
 	resp, err := httpClient.Post(apiURL, "application/json", bytes.NewReader(payload))
 	if err != nil {
@@ -88,10 +88,7 @@ func tgSendText(msg string) {
 func tgEditMessage(messageID int, msg string) {
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/editMessageText", TG_BOT_TOKEN)
 	payload, _ := json.Marshal(map[string]interface{}{
-		"chat_id":    TG_CHAT_ID,
-		"message_id": messageID,
-		"text":       msg,
-		"parse_mode": "HTML",
+		"chat_id": TG_CHAT_ID, "message_id": messageID, "text": msg, "parse_mode": "HTML",
 	})
 	resp, err := httpClient.Post(apiURL, "application/json", bytes.NewReader(payload))
 	if err != nil {
@@ -108,7 +105,6 @@ func tgSendFile(filePath string, caption string) error {
 	defer file.Close()
 
 	boundary := "----GoFormBoundary" + strconv.FormatInt(rand.Int63(), 16)
-
 	var body bytes.Buffer
 	body.WriteString(fmt.Sprintf("--%s\r\n", boundary))
 	body.WriteString(fmt.Sprintf("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n%s\r\n", TG_CHAT_ID))
@@ -129,80 +125,64 @@ func tgSendFile(filePath string, caption string) error {
 		return err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("TG upload failed (%d): %s", resp.StatusCode, string(respBody))
+		rb, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("TG upload failed (%d): %s", resp.StatusCode, string(rb))
 	}
 	return nil
 }
 
 func splitAndSendFiles(basePath string) {
 	const maxBytes = TG_MAX_FILE_MB * 1024 * 1024
-
 	data, err := os.ReadFile(basePath)
 	if err != nil {
 		tgSendText(fmt.Sprintf("❌ Failed to read %s: %v", basePath, err))
 		return
 	}
-
 	if len(data) <= maxBytes {
 		caption := fmt.Sprintf("📁 valid_sites.txt (%.2f MB)", float64(len(data))/(1024*1024))
 		if err := tgSendFile(basePath, caption); err != nil {
-			tgSendText(fmt.Sprintf("❌ File upload failed: %v", err))
+			tgSendText(fmt.Sprintf("❌ Upload failed: %v", err))
 		} else {
-			tgSendText("✅ File sent successfully!")
+			tgSendText("✅ File sent!")
 		}
 		return
 	}
 
 	lines := strings.Split(string(data), "\n")
-	var currentChunk strings.Builder
-	partNum := 1
-	totalParts := 0
-
-	// Pre-calculate total parts
-	for _, line := range lines {
-		if currentChunk.Len()+len(line)+1 > maxBytes && currentChunk.Len() > 0 {
+	var chunk strings.Builder
+	partNum, totalParts := 1, 0
+	for _, l := range lines {
+		if chunk.Len()+len(l)+1 > maxBytes && chunk.Len() > 0 {
 			totalParts++
-			currentChunk.Reset()
+			chunk.Reset()
 		}
-		currentChunk.WriteString(line + "\n")
+		chunk.WriteString(l + "\n")
 	}
-	if currentChunk.Len() > 0 {
+	if chunk.Len() > 0 {
 		totalParts++
 	}
 
-	currentChunk.Reset()
+	chunk.Reset()
 	partNum = 1
-
-	for _, line := range lines {
-		if currentChunk.Len()+len(line)+1 > maxBytes && currentChunk.Len() > 0 {
-			chunkPath := fmt.Sprintf("valid_sites_part%d.txt", partNum)
-			os.WriteFile(chunkPath, []byte(currentChunk.String()), 0644)
-
-			caption := fmt.Sprintf("📁 Part %d/%d (%.2f MB)", partNum, totalParts, float64(currentChunk.Len())/(1024*1024))
-			if err := tgSendFile(chunkPath, caption); err != nil {
-				tgSendText(fmt.Sprintf("❌ Part %d upload failed: %v", partNum, err))
-			}
-			os.Remove(chunkPath)
+	for _, l := range lines {
+		if chunk.Len()+len(l)+1 > maxBytes && chunk.Len() > 0 {
+			path := fmt.Sprintf("valid_sites_part%d.txt", partNum)
+			os.WriteFile(path, []byte(chunk.String()), 0644)
+			tgSendFile(path, fmt.Sprintf("📁 Part %d/%d", partNum, totalParts))
+			os.Remove(path)
 			partNum++
-			currentChunk.Reset()
-			time.Sleep(500 * time.Millisecond) // Rate limit between uploads
+			chunk.Reset()
+			time.Sleep(500 * time.Millisecond)
 		}
-		currentChunk.WriteString(line + "\n")
+		chunk.WriteString(l + "\n")
 	}
-
-	if currentChunk.Len() > 0 {
-		chunkPath := fmt.Sprintf("valid_sites_part%d.txt", partNum)
-		os.WriteFile(chunkPath, []byte(currentChunk.String()), 0644)
-		caption := fmt.Sprintf("📁 Part %d/%d (%.2f MB)", partNum, totalParts, float64(currentChunk.Len())/(1024*1024))
-		if err := tgSendFile(chunkPath, caption); err != nil {
-			tgSendText(fmt.Sprintf("❌ Part %d upload failed: %v", partNum, err))
-		}
-		os.Remove(chunkPath)
+	if chunk.Len() > 0 {
+		path := fmt.Sprintf("valid_sites_part%d.txt", partNum)
+		os.WriteFile(path, []byte(chunk.String()), 0644)
+		tgSendFile(path, fmt.Sprintf("📁 Part %d/%d", partNum, totalParts))
+		os.Remove(path)
 	}
-
 	tgSendText(fmt.Sprintf("✅ All %d parts sent!", totalParts))
 }
 
@@ -214,24 +194,17 @@ func startProgressUpdater() int {
 	tgSendText("🚀 <b>Shopify Harvester Started</b>\n⏳ Initializing...")
 	time.Sleep(1 * time.Second)
 
-	// Send initial message and get message_id for editing
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", TG_BOT_TOKEN)
 	payload, _ := json.Marshal(map[string]interface{}{
-		"chat_id":    TG_CHAT_ID,
-		"text":       "⏳ Starting...",
-		"parse_mode": "HTML",
+		"chat_id": TG_CHAT_ID, "text": "⏳ Starting...", "parse_mode": "HTML",
 	})
 	resp, err := httpClient.Post(apiURL, "application/json", bytes.NewReader(payload))
 	if err != nil {
-		log.Printf("[PROGRESS] Failed to create progress message: %v", err)
 		return 0
 	}
 	defer resp.Body.Close()
-
 	var result struct {
-		Result struct {
-			MessageID int `json:"message_id"`
-		} `json:"result"`
+		Result struct{ MessageID int `json:"message_id"` } `json:"result"`
 	}
 	json.NewDecoder(resp.Body).Decode(&result)
 	messageID := result.Result.MessageID
@@ -239,43 +212,38 @@ func startProgressUpdater() int {
 	go func() {
 		ticker := time.NewTicker(time.Duration(TG_UPDATE_SEC) * time.Second)
 		defer ticker.Stop()
-
 		for range ticker.C {
 			elapsed := time.Since(progress.StartTime).Seconds()
 			scraped := atomic.LoadInt64(&progress.Scraped)
 			validated := atomic.LoadInt64(&progress.Validated)
 			valid := atomic.LoadInt64(&progress.ValidFound)
 			total := atomic.LoadInt64(&progress.TotalCandidates)
+			sbUsed := atomic.LoadInt64(&progress.SBRequestsUsed)
 			phase := progress.Phase
-
 			rate := float64(0)
 			if elapsed > 0 {
 				rate = float64(validated) / elapsed
 			}
-
-			progressBar := ""
+			pBar := ""
 			if total > 0 {
 				pct := float64(validated) / float64(total) * 100
 				filled := int(pct / 5)
 				if filled > 20 {
 					filled = 20
 				}
-				progressBar = strings.Repeat("█", filled) + strings.Repeat("░", 20-filled)
-				progressBar = fmt.Sprintf("[%s] %.1f%%", progressBar, pct)
+				pBar = fmt.Sprintf("[%s%s] %.1f%%", strings.Repeat("█", filled), strings.Repeat("░", 20-filled), pct)
 			}
-
 			msg := fmt.Sprintf(
 				"<b>🔄 Shopify Harvester — Live</b>\n\n"+
-					"📍 Phase: <code>%s</code>\n"+
-					"%s\n\n"+
+					"📍 Phase: <code>%s</code>\n%s\n\n"+
 					"📡 Scraped: <b>%d</b>\n"+
 					"🔍 Validated: <b>%d / %d</b>\n"+
 					"✅ Valid Found: <b>%d</b>\n"+
-					"⚡ Rate: <b>%.1f sites/sec</b>\n"+
+					"🔑 SB Requests: <b>%d / 1000</b>\n"+
+					"⚡ Rate: <b>%.1f/sec</b>\n"+
 					"⏱️ Elapsed: <b>%.0fs</b>",
-				phase, progressBar, scraped, validated, total, valid, rate, elapsed,
+				phase, pBar, scraped, validated, total, valid, sbUsed, rate, elapsed,
 			)
-
 			if messageID > 0 {
 				tgEditMessage(messageID, msg)
 			} else {
@@ -283,7 +251,6 @@ func startProgressUpdater() int {
 			}
 		}
 	}()
-
 	return messageID
 }
 
@@ -291,16 +258,11 @@ func stopProgressUpdater(messageID int) {
 	elapsed := time.Since(progress.StartTime).Seconds()
 	valid := atomic.LoadInt64(&progress.ValidFound)
 	total := atomic.LoadInt64(&progress.TotalCandidates)
-
 	msg := fmt.Sprintf(
 		"<b>✅ Harvest Complete!</b>\n\n"+
-			"✅ Valid Sites: <b>%d</b>\n"+
-			"📊 Total Scanned: <b>%d</b>\n"+
-			"⏱️ Total Time: <b>%.1fs</b>\n\n"+
-			"<i>Sending file(s)...</i>",
+			"✅ Valid Sites: <b>%d</b>\n📊 Scanned: <b>%d</b>\n⏱️ Time: <b>%.1fs</b>\n\n<i>Sending file(s)...</i>",
 		valid, total, elapsed,
 	)
-
 	if messageID > 0 {
 		tgEditMessage(messageID, msg)
 	} else {
@@ -309,7 +271,7 @@ func stopProgressUpdater(messageID int) {
 }
 
 // ==========================================
-// SOURCE 1: SCRAPINGBEE GOOGLE DORKS
+// SOURCE 1: SCRAPINGBEE GOOGLE DORKS (FIXED PARSING)
 // ==========================================
 
 var HIGH_VALUE_DORKS = []string{
@@ -323,14 +285,18 @@ var HIGH_VALUE_DORKS = []string{
 	`"shopify.com/products" "add to cart" -site:shopify.com`,
 	`site:myshopify.com "subscribe" OR "subscription"`,
 	`inanchor:"shopify" "add to cart" -site:shopify.com`,
+	`site:*.myshopify.com -site:shopify.com`,
+	`"myshopify.com" "cart" "checkout" -site:shopify.com`,
+	`site:myshopify.com "collections/all"`,
+	`"cdn.shopify.com" "add to cart" -site:shopify.com`,
+	`site:myshopify.com "product" "price"`,
 }
 
 func scrapeGoogleDorks() []string {
 	progress.Phase = "Google Dorks (ScrapingBee)"
-
 	var mu sync.Mutex
 	var results []string
-	sem := make(chan struct{}, 10)
+	sem := make(chan struct{}, 5) // Conservative concurrency for API
 	var wg sync.WaitGroup
 
 	for _, dork := range HIGH_VALUE_DORKS {
@@ -338,6 +304,12 @@ func scrapeGoogleDorks() []string {
 			wg.Add(1)
 			go func(q string, p int) {
 				defer wg.Done()
+
+				if atomic.LoadInt64(&progress.SBRequestsUsed) >= 1000 {
+					return
+				}
+				atomic.AddInt64(&progress.SBRequestsUsed, 1)
+
 				sem <- struct{}{}
 				defer func() { <-sem }()
 
@@ -353,77 +325,180 @@ func scrapeGoogleDorks() []string {
 				apiURL := "https://app.scrapingbee.com/api/v1/store/google?" + params.Encode()
 				resp, err := httpClient.Get(apiURL)
 				if err != nil {
+					log.Printf("[SB] Error dork=%s page=%d: %v", q[:min(30, len(q))], p, err)
 					return
 				}
 				defer resp.Body.Close()
-
 				body, _ := io.ReadAll(resp.Body)
+
 				if resp.StatusCode != 200 {
+					log.Printf("[SB] Status %d dork=%s page=%d body=%s", resp.StatusCode, q[:min(30, len(q))], p, string(body)[:min(200, len(body))])
 					return
 				}
 
+				// FIXED: Parse ScrapingBee JSON response correctly
 				var data map[string]interface{}
 				if err := json.Unmarshal(body, &data); err != nil {
+					log.Printf("[SB] JSON parse error: %v", err)
 					return
 				}
 
-				orgResults, ok := data["organic_results"].([]interface{})
-				if !ok {
-					return
+				count := 0
+				// Try multiple possible response structures
+				extractLinks := func(items []interface{}) {
+					for _, item := range items {
+						m, ok := item.(map[string]interface{})
+						if !ok {
+							continue
+						}
+						link := ""
+						if l, ok := m["link"].(string); ok {
+							link = l
+						} else if l, ok := m["url"].(string); ok {
+							link = l
+						} else if l, ok := m["href"].(string); ok {
+							link = l
+						}
+						if link != "" {
+							mu.Lock()
+							results = append(results, link)
+							mu.Unlock()
+							count++
+						}
+					}
 				}
 
-				mu.Lock()
-				for _, r := range orgResults {
-					rm, ok := r.(map[string]interface{})
-					if !ok {
-						continue
-					}
-					link, _ := rm["link"].(string)
-					if link != "" {
-						results = append(results, link)
+				// Structure 1: organic_results array
+				if orgResults, ok := data["organic_results"].([]interface{}); ok {
+					extractLinks(orgResults)
+				}
+				// Structure 2: results array
+				if res, ok := data["results"].([]interface{}); ok {
+					extractLinks(res)
+				}
+				// Structure 3: nested in google_results
+				if gr, ok := data["google_results"].(map[string]interface{}); ok {
+					if org, ok := gr["organic_results"].([]interface{}); ok {
+						extractLinks(org)
 					}
 				}
-				mu.Unlock()
+				// Structure 4: raw HTML fallback - extract URLs directly
+				if count == 0 {
+					if html, ok := data["html"].(string); ok {
+						reLink := regexp.MustCompile(`href="(https?://[^"]*myshopify\.com[^"]*)"`)
+						matches := reLink.FindAllStringSubmatch(html, -1)
+						for _, m := range matches {
+							mu.Lock()
+							results = append(results, m[1])
+							mu.Unlock()
+							count++
+						}
+						reLink2 := regexp.MustCompile(`"(https?://[a-zA-Z0-9-]+\.myshopify\.com[^"]*)"`)
+						matches2 := reLink2.FindAllStringSubmatch(html, -1)
+						for _, m := range matches2 {
+							mu.Lock()
+							results = append(results, m[1])
+							mu.Unlock()
+							count++
+						}
+					}
+				}
 
-				atomic.AddInt64(&progress.Scraped, int64(len(orgResults)))
+				atomic.AddInt64(&progress.Scraped, int64(count))
+				if count > 0 {
+					log.Printf("[SB] Got %d results from dork=%s page=%d", count, q[:min(30, len(q))], p)
+				}
 			}(dork, page)
 		}
 	}
-
 	wg.Wait()
-	log.Printf("[SCRAPE] Google dorks: %d candidates", len(results))
+	log.Printf("[SCRAPE] Google dorks total: %d candidates", len(results))
 	return results
 }
 
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // ==========================================
-// SOURCE 2: DNS ENUMERATION
+// SOURCE 2: MASSIVE DNS ENUMERATION
 // ==========================================
 
-var DNS_WORDLIST = []string{
-	"store", "shop", "buy", "deal", "sale", "offer", "best", "top", "new", "hot",
-	"fashion", "style", "wear", "gear", "tech", "gadget", "home", "life", "fit",
-	"sport", "outdoor", "beauty", "skin", "hair", "pet", "baby", "kid", "toy",
-	"game", "book", "art", "craft", "food", "drink", "coffee", "tea", "wine",
-	"health", "wellness", "yoga", "gym", "run", "bike", "swim", "camp", "hike",
-	"luxury", "premium", "elite", "pro", "max", "ultra", "mega", "super", "hyper",
-	"eco", "green", "organic", "natural", "pure", "fresh", "clean", "smart",
-	"alpha", "beta", "gamma", "delta", "omega", "nova", "apex", "peak", "rise",
-	"bolt", "flash", "swift", "rapid", "turbo", "nitro", "spark", "blaze", "flame",
-	"ocean", "river", "lake", "mountain", "forest", "valley", "desert", "arctic",
-	"urban", "metro", "city", "town", "village", "country", "world", "global",
-	"daily", "weekly", "monthly", "seasonal", "annual", "forever", "eternal",
-	"golden", "silver", "diamond", "crystal", "royal", "king", "queen", "crown",
+func generateDNSWordlist() []string {
+	prefixes := []string{
+		"store", "shop", "buy", "deal", "sale", "offer", "best", "top", "new", "hot",
+		"fashion", "style", "wear", "gear", "tech", "gadget", "home", "life", "fit",
+		"sport", "outdoor", "beauty", "skin", "hair", "pet", "baby", "kid", "toy",
+		"game", "book", "art", "craft", "food", "drink", "coffee", "tea", "wine",
+		"health", "wellness", "yoga", "gym", "run", "bike", "swim", "camp", "hike",
+		"luxury", "premium", "elite", "pro", "max", "ultra", "mega", "super", "hyper",
+		"eco", "green", "organic", "natural", "pure", "fresh", "clean", "smart",
+		"alpha", "beta", "gamma", "delta", "omega", "nova", "apex", "peak", "rise",
+		"bolt", "flash", "swift", "rapid", "turbo", "nitro", "spark", "blaze", "flame",
+		"ocean", "river", "lake", "mountain", "forest", "valley", "desert", "arctic",
+		"urban", "metro", "city", "town", "village", "country", "world", "global",
+		"daily", "weekly", "monthly", "seasonal", "annual", "forever", "eternal",
+		"golden", "silver", "diamond", "crystal", "royal", "king", "queen", "crown",
+		"red", "blue", "black", "white", "gold", "dark", "light", "bright", "vivid",
+		"zen", "flow", "pulse", "wave", "drift", "shift", "lift", "glow", "bloom",
+		"nest", "den", "hub", "lab", "box", "spot", "zone", "base", "core", "edge",
+		"mint", "sage", "rose", "lily", "iris", "jade", "coral", "amber", "onyx",
+		"fox", "wolf", "bear", "hawk", "eagle", "lion", "tiger", "panda", "koala",
+		"sun", "moon", "star", "sky", "cloud", "rain", "snow", "storm", "thunder",
+		"north", "south", "east", "west", "polar", "tropic", "equator", "horizon",
+		"vintage", "retro", "classic", "modern", "future", "neo", "prime", "first",
+		"happy", "lucky", "brave", "bold", "wild", "free", "true", "real", "epic",
+		"silk", "linen", "cotton", "wool", "leather", "denim", "canvas", "velvet",
+		"kitchen", "garden", "closet", "wardrobe", "pantry", "cellar", "attic",
+		"market", "bazaar", "emporium", "boutique", "outlet", "depot", "supply",
+	}
+
+	suffixes := []string{
+		"", "co", "hq", "us", "uk", "ca", "au", "de", "fr", "jp", "shop", "store",
+		"official", "original", "direct", "online", "digital", "global", "world",
+		"plus", "now", "go", "one", "two", "three", "x", "z", "io", "app",
+	}
+
+	var words []string
+	for _, p := range prefixes {
+		for _, s := range suffixes {
+			if s == "" {
+				words = append(words, p)
+			} else {
+				words = append(words, p+s)
+				words = append(words, p+"-"+s)
+				words = append(words, p+"_"+s)
+			}
+		}
+	}
+
+	// Add numeric variants for top prefixes
+	topPrefixes := prefixes[:50]
+	for _, p := range topPrefixes {
+		for i := 1; i <= 99; i++ {
+			words = append(words, fmt.Sprintf("%s%d", p, i))
+		}
+	}
+
+	log.Printf("[DNS] Generated %d wordlist entries", len(words))
+	return words
 }
 
 func enumerateDNS() []string {
 	progress.Phase = "DNS Enumeration"
+	wordlist := generateDNSWordlist()
 
 	var results []string
 	var mu sync.Mutex
-	sem := make(chan struct{}, 500)
+	sem := make(chan struct{}, 1000)
 	var wg sync.WaitGroup
 
-	for _, word := range DNS_WORDLIST {
+	resolver := &net.Resolver{PreferGo: true}
+
+	for _, word := range wordlist {
 		domain := word + ".myshopify.com"
 		wg.Add(1)
 		go func(d string) {
@@ -434,7 +509,7 @@ func enumerateDNS() []string {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 
-			addrs, err := net.DefaultResolver.LookupHost(ctx, d)
+			addrs, err := resolver.LookupHost(ctx, d)
 			if err == nil && len(addrs) > 0 {
 				mu.Lock()
 				results = append(results, "https://"+d)
@@ -445,7 +520,72 @@ func enumerateDNS() []string {
 	}
 
 	wg.Wait()
-	log.Printf("[DNS] Found %d live subdomains", len(results))
+	log.Printf("[DNS] Found %d live subdomains from %d words", len(results), len(wordlist))
+	return results
+}
+
+// ==========================================
+// SOURCE 3: COMMONCRAWL INDEX FILTERING
+// ==========================================
+
+func scrapeCommonCrawlIndex() []string {
+	progress.Phase = "CommonCrawl Index"
+
+	// Latest CommonCrawl index endpoints
+	indexURLs := []string{
+		"https://index.commoncrawl.org/CC-MAIN-2024-51-index?url=*.myshopify.com&output=json&limit=100000",
+		"https://index.commoncrawl.org/CC-MAIN-2024-46-index?url=*.myshopify.com&output=json&limit=100000",
+		"https://index.commoncrawl.org/CC-MAIN-2024-42-index?url=*.myshopify.com&output=json&limit=100000",
+	}
+
+	var mu sync.Mutex
+	var results []string
+	var wg sync.WaitGroup
+
+	for _, idxURL := range indexURLs {
+		wg.Add(1)
+		go func(u string) {
+			defer wg.Done()
+			resp, err := httpClient.Get(u)
+			if err != nil {
+				log.Printf("[CC] Failed %s: %v", u, err)
+				return
+			}
+			defer resp.Body.Close()
+
+			scanner := bufio.NewScanner(resp.Body)
+			scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+			count := 0
+			for scanner.Scan() {
+				line := scanner.Text()
+				var entry map[string]interface{}
+				if err := json.Unmarshal([]byte(line), &entry); err != nil {
+					continue
+				}
+				urlStr, ok := entry["url"].(string)
+				if !ok || urlStr == "" {
+					continue
+				}
+				// Extract domain from URL
+				parsed, err := url.Parse(urlStr)
+				if err != nil {
+					continue
+				}
+				host := parsed.Hostname()
+				if strings.HasSuffix(host, ".myshopify.com") {
+					mu.Lock()
+					results = append(results, "https://"+host)
+					mu.Unlock()
+					count++
+				}
+			}
+			atomic.AddInt64(&progress.Scraped, int64(count))
+			log.Printf("[CC] Got %d domains from %s", count, u[len(u)-30:])
+		}(idxURL)
+	}
+
+	wg.Wait()
+	log.Printf("[CC] Total CommonCrawl domains: %d", len(results))
 	return results
 }
 
@@ -569,23 +709,19 @@ func validateSite(ctx context.Context, rawURL string) *ValidSite {
 	for _, ver := range API_VERSIONS {
 		gqlURL := fmt.Sprintf("%s/api/%s/graphql.json", baseURL, ver)
 		payload, _ := json.Marshal(map[string]interface{}{
-			"query":     STOREFRONT_QUERY,
-			"variables": map[string]int{"first": 50},
+			"query": STOREFRONT_QUERY, "variables": map[string]int{"first": 50},
 		})
-
 		gqlReq, _ := http.NewRequestWithContext(ctx, "POST", gqlURL, bytes.NewReader(payload))
 		gqlReq.Header.Set("Content-Type", "application/json")
 		if token != "" {
 			gqlReq.Header.Set("X-Shopify-Storefront-Access-Token", token)
 		}
-
 		gqlResp, err := httpClient.Do(gqlReq)
 		if err != nil {
 			continue
 		}
 		gqlBody, _ := io.ReadAll(gqlResp.Body)
 		gqlResp.Body.Close()
-
 		if gqlResp.StatusCode == 200 {
 			if err := json.Unmarshal(gqlBody, &gqlData); err == nil && gqlData["data"] != nil {
 				break
@@ -613,7 +749,6 @@ func validateSite(ctx context.Context, rawURL string) *ValidSite {
 		band     int
 		shipping bool
 	}
-
 	var candidates []candidate
 	reVid := regexp.MustCompile(`ProductVariant/(\d+)`)
 
@@ -639,7 +774,6 @@ func validateSite(ctx context.Context, rawURL string) *ValidSite {
 				continue
 			}
 			ship, _ := vNode["requiresShipping"].(bool)
-
 			band := 4
 			if price <= 1.0 {
 				band = 1
@@ -648,17 +782,13 @@ func validateSite(ctx context.Context, rawURL string) *ValidSite {
 			} else if price <= 10.0 {
 				band = 3
 			}
-
-			candidates = append(candidates, candidate{
-				id: m[1], price: price, currency: curStr, band: band, shipping: ship,
-			})
+			candidates = append(candidates, candidate{id: m[1], price: price, currency: curStr, band: band, shipping: ship})
 		}
 	}
 
 	if len(candidates) == 0 {
 		return nil
 	}
-
 	best := candidates[0]
 	for _, c := range candidates[1:] {
 		if c.band < best.band ||
@@ -667,13 +797,7 @@ func validateSite(ctx context.Context, rawURL string) *ValidSite {
 			best = c
 		}
 	}
-
-	return &ValidSite{
-		Domain:    baseURL,
-		VariantID: best.id,
-		Price:     best.price,
-		Currency:  best.currency,
-	}
+	return &ValidSite{Domain: baseURL, VariantID: best.id, Price: best.price, Currency: best.currency}
 }
 
 // ==========================================
@@ -684,19 +808,39 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 	log.Println("🚀 Shopify Harvester starting...")
 
-	// Start live progress updater
 	messageID := startProgressUpdater()
 
-	// Stage 1: Harvest
+	// Stage 1: Harvest from ALL sources concurrently
 	var allCandidates []string
+	var harvestMu sync.Mutex
+	var harvestWg sync.WaitGroup
 
-	log.Println("📡 Scraping Google Dorks via ScrapingBee...")
-	dorkResults := scrapeGoogleDorks()
-	allCandidates = append(allCandidates, dorkResults...)
+	appendResults := func(name string, results []string) {
+		harvestMu.Lock()
+		allCandidates = append(allCandidates, results...)
+		harvestMu.Unlock()
+		log.Printf("📦 %s contributed %d candidates", name, len(results))
+	}
 
-	log.Println("📡 DNS Enumeration...")
-	dnsResults := enumerateDNS()
-	allCandidates = append(allCandidates, dnsResults...)
+	// Run all sources concurrently
+	harvestWg.Add(3)
+	go func() {
+		defer harvestWg.Done()
+		r := scrapeGoogleDorks()
+		appendResults("Google Dorks", r)
+	}()
+	go func() {
+		defer harvestWg.Done()
+		r := enumerateDNS()
+		appendResults("DNS Enumeration", r)
+	}()
+	go func() {
+		defer harvestWg.Done()
+		r := scrapeCommonCrawlIndex()
+		appendResults("CommonCrawl", r)
+	}()
+
+	harvestWg.Wait()
 
 	// Deduplicate
 	seen := make(map[string]bool)
@@ -708,9 +852,8 @@ func main() {
 			unique = append(unique, u)
 		}
 	}
-
 	atomic.StoreInt64(&progress.TotalCandidates, int64(len(unique)))
-	log.Printf("📊 Unique candidates: %d", len(unique))
+	log.Printf("📊 Total unique candidates: %d", len(unique))
 
 	// Stage 2: Validate
 	progress.Phase = "Validation"
@@ -727,12 +870,9 @@ func main() {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-
 			atomic.AddInt64(&progress.Validated, 1)
-
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-
 			result := validateSite(ctx, s)
 			if result != nil {
 				mu.Lock()
@@ -742,7 +882,6 @@ func main() {
 			}
 		}(site)
 	}
-
 	wg.Wait()
 
 	// Stage 3: Output
@@ -753,12 +892,9 @@ func main() {
 		output.WriteString(fmt.Sprintf("%s|%s|%.2f|%s\n", vs.Domain, vs.VariantID, vs.Price, vs.Currency))
 	}
 	os.WriteFile("valid_sites.txt", []byte(output.String()), 0644)
-
 	fileInfo, _ := os.Stat("valid_sites.txt")
 	log.Printf("✅ %d valid sites saved (%.2f MB)", len(validSites), float64(fileInfo.Size())/(1024*1024))
 
-	// Send file(s) to Telegram with auto-splitting
 	splitAndSendFiles("valid_sites.txt")
-
 	log.Println("🎉 Harvest complete!")
 }
