@@ -107,7 +107,6 @@ func tgSendFile(filePath string, caption string) error {
 	}
 	defer file.Close()
 
-	stat, _ := file.Stat()
 	boundary := "----GoFormBoundary" + strconv.FormatInt(rand.Int63(), 16)
 
 	var body bytes.Buffer
