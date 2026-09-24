@@ -1,0 +1,21 @@
+name: Shopify Site Harvester
+
+on:
+  workflow_dispatch:
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      - run: go build -o harvester harvester.go
+      - run: ./harvester
+      - uses: actions/upload-artifact@v4
+        with:
+          name: valid-sites
+          path: valid_sites*.txt
+          retention-days: 30
